@@ -1,4 +1,4 @@
-//go:build cgo && (windows || linux || darwin) && (arm64 || amd64)
+//go:build cgo && (windows || linux || darwin) && (arm64 || amd64) && !android
 
 // Package velopack provides a Go interface to the Velopack library for managing software updates and distribution on desktop.
 package velopack
@@ -79,7 +79,7 @@ func go_free_release_feed_callback(_ uintptr, psz_feed *C.char) {
 func go_download_asset_callback(user_data uintptr, asset *C.vpkc_asset_t, psz_local_path *C.char, progress_callback_id C.size_t) C.bool {
 	callbacks := cgo.Handle(user_data).Value().(SourceCustomCallbacks)
 	success := callbacks.DownloadAssetFunc(
-		toAsset(asset),
+		toAsset(asset, false),
 		C.GoString(psz_local_path),
 		func(progress int16) {
 			C.vpkc_source_report_progress(progress_callback_id, C.int16_t(progress))
@@ -149,7 +149,7 @@ func go_log_callback(_ uintptr, level, psz_message *C.char) {
 	app.Logger(C.GoString(level), C.GoString(psz_message))
 }
 
-func toAsset(asset *C.vpkc_asset_t) *Asset {
+func toAsset(asset *C.vpkc_asset_t, owned bool) *Asset {
 	if asset == nil {
 		return nil
 	}
@@ -165,9 +165,11 @@ func toAsset(asset *C.vpkc_asset_t) *Asset {
 		NotesMarkdown: C.GoString(asset.NotesMarkdown),
 		NotesHTML:     C.GoString(asset.NotesHtml),
 	}
-	runtime.AddCleanup(converted, func(handle unsafe.Pointer) {
-		C.vpkc_free_asset((*C.vpkc_asset_t)(handle))
-	}, converted.handle)
+	if owned {
+		runtime.AddCleanup(converted, func(handle unsafe.Pointer) {
+			C.vpkc_free_asset((*C.vpkc_asset_t)(handle))
+		}, converted.handle)
+	}
 	return converted
 }
 
@@ -176,12 +178,13 @@ func (info *UpdateInfo) load(update_info *C.vpkc_update_info_t) *UpdateInfo {
 	// DeltasToTarget as a NULL-terminated **C.vpkc_asset_t array via raw pointer
 	// arithmetic, but the native side does not actually NULL-terminate it — the
 	// walk read past the real entries into unrelated memory and crashed the
-	// whole process (a native fault, uncatchable by Go's recover). Callers never
-	// consume DeltasToTarget on the Go side (only TargetFullRelease), and the
-	// actual delta-vs-full download decision happens natively against the raw C
-	// handle in DownloadUpdates, not through this slice — so leaving it
-	// unpopulated has no behavioral effect.
+	// whole process (a native fault, uncatchable by Go's recover). DeltasToTargetCount
+	// gives the real element count, so bound the read with unsafe.Slice instead.
 	var deltas []*Asset
+	var sliced = unsafe.Slice(update_info.DeltasToTarget, update_info.DeltasToTargetCount)
+	for _, delta := range sliced {
+		deltas = append(deltas, toAsset(delta, false))
+	}
 	if info.handle != unsafe.Pointer(update_info) {
 		runtime.AddCleanup(info, func(handle *C.vpkc_update_info_t) {
 			C.vpkc_free_update_info(handle)
@@ -189,8 +192,8 @@ func (info *UpdateInfo) load(update_info *C.vpkc_update_info_t) *UpdateInfo {
 	}
 	*info = UpdateInfo{
 		handle:            unsafe.Pointer(update_info),
-		TargetFullRelease: toAsset(update_info.TargetFullRelease),
-		BaseRelease:       toAsset(update_info.BaseRelease),
+		TargetFullRelease: toAsset(update_info.TargetFullRelease, false),
+		BaseRelease:       toAsset(update_info.BaseRelease, false),
 		DeltasToTarget:    deltas,
 		IsDowngrade:       bool(update_info.IsDowngrade),
 	}
@@ -329,7 +332,7 @@ func (up *UpdateManager) UpdatePendingRestart() (*Asset, bool) {
 	if !C.vpkc_update_pending_restart(up.handle, &asset) {
 		return nil, false
 	}
-	return toAsset(asset), true
+	return toAsset(asset, true), true
 }
 
 // CheckForUpdates Checks for updates. If there are updates available, this method will return an [UpdateInfo]
@@ -348,11 +351,12 @@ func (up *UpdateManager) CheckForUpdates() (*UpdateInfo, UpdateStatus, error) {
 	return &info, UpdateStatus(check_result), nil
 }
 
-func assetSilentRestart(options ...upto3[Silent, Restart, UnsafeProcessID]) (C.bool, int, **C.char, int, bool) {
+func assetSilentRestart(options ...upto3[Silent, Restart, UnsafeProcessID]) (C.bool, int, **C.char, int, bool, func()) {
 	var silent C.bool
 	var restart []*C.char
 	var pid int
 	var has_pid bool
+	var defers []func()
 	for _, option := range options {
 		switch option := option.(type) {
 		case Silent:
@@ -361,7 +365,7 @@ func assetSilentRestart(options ...upto3[Silent, Restart, UnsafeProcessID]) (C.b
 			restart = make([]*C.char, len(option)+1) // +1 for null terminator
 			for i, arg := range option {
 				arg_cstr := C.CString(arg)
-				defer C.free(unsafe.Pointer(arg_cstr))
+				defers = append(defers, func() { C.free(unsafe.Pointer(arg_cstr)) })
 				restart[i] = arg_cstr
 			}
 		case UnsafeProcessID:
@@ -373,7 +377,11 @@ func assetSilentRestart(options ...upto3[Silent, Restart, UnsafeProcessID]) (C.b
 	if len(restart) > 0 {
 		restartPtr = (**C.char)(unsafe.Pointer(&restart[0]))
 	}
-	return silent, len(restart), restartPtr, pid, has_pid
+	return silent, len(restart), restartPtr, pid, has_pid, func() {
+		for _, def := range defers {
+			def()
+		}
+	}
 }
 
 // WaitForExitThenApplyUpdates this will launch the Velopack updater and tell it to wait for this program
@@ -381,7 +389,8 @@ func assetSilentRestart(options ...upto3[Silent, Restart, UnsafeProcessID]) (C.b
 //   - You should then clean up any state and exit your app. The updater will apply updates and then
 //   - (if [Restart] specified) restart your app. The updater will only wait for 60 seconds before giving up.
 func (up *UpdateManager) WaitForExitThenApplyUpdates(update either[*UpdateInfo, *Asset], options ...upto3[Silent, Restart, UnsafeProcessID]) error {
-	silent, restart, restartPtr, pid, has_pid := assetSilentRestart(options...)
+	silent, restart, restartPtr, pid, has_pid, defers := assetSilentRestart(options...)
+	defer defers()
 	p_asset := (*C.vpkc_asset_t)(nil)
 	if update != nil {
 		switch update := update.(type) {
