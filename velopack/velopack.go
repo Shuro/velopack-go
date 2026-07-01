@@ -172,12 +172,16 @@ func toAsset(asset *C.vpkc_asset_t) *Asset {
 }
 
 func (info *UpdateInfo) load(update_info *C.vpkc_update_info_t) *UpdateInfo {
+	// PATCHED (fork, see github.com/Shuro/velopack-go): upstream walked
+	// DeltasToTarget as a NULL-terminated **C.vpkc_asset_t array via raw pointer
+	// arithmetic, but the native side does not actually NULL-terminate it — the
+	// walk read past the real entries into unrelated memory and crashed the
+	// whole process (a native fault, uncatchable by Go's recover). Callers never
+	// consume DeltasToTarget on the Go side (only TargetFullRelease), and the
+	// actual delta-vs-full download decision happens natively against the raw C
+	// handle in DownloadUpdates, not through this slice — so leaving it
+	// unpopulated has no behavioral effect.
 	var deltas []*Asset
-	if update_info.DeltasToTarget != nil {
-		for ptr := update_info.DeltasToTarget; *ptr != nil; ptr = (**C.vpkc_asset_t)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + unsafe.Sizeof(*ptr))) {
-			deltas = append(deltas, toAsset(*ptr))
-		}
-	}
 	if info.handle != unsafe.Pointer(update_info) {
 		runtime.AddCleanup(info, func(handle *C.vpkc_update_info_t) {
 			C.vpkc_free_update_info(handle)
